@@ -16,6 +16,7 @@ import pytest
 from docling_serve.gdocs import (
     GdocError,
     GdocRef,
+    fetch_export_bytes,
     materialize_gdoc,
     normalize_gdoc_sources,
     parse_gdoc_url,
@@ -23,6 +24,7 @@ from docling_serve.gdocs import (
 
 DOC_ID = "1aBcDeFgHiJkLmNoPqRsTuVw"
 REF = GdocRef(kind="document", doc_id=DOC_ID)
+KEYED_REF = GdocRef(kind="document", doc_id=DOC_ID, resource_key="0-AbCdEfGhIjKl")
 ARXIV_URL = "https://arxiv.org/pdf/2408.09869"
 
 Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
@@ -158,3 +160,143 @@ def test_normalize_replaces_google_source_with_file():
     assert len(result.sources) == 1
     assert result.sources[0].kind == "file"
     assert result.sources[0].filename == f"{DOC_ID}.docx"
+
+
+def test_resource_key_retry_without_key_wins_and_honours_filename():
+    """A keyed link denied once is retried without the key and can succeed."""
+    queries: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.query)
+        if b"resourcekey" in request.url.query:
+            return httpx.Response(410)
+        return httpx.Response(
+            200,
+            headers={
+                "content-disposition": 'attachment; filename="Chapter 2 Report.docx"'
+            },
+            content=b"PK\x03\x04docx-bytes",
+        )
+
+    async def scenario():
+        async with _mock_client(handler) as client:
+            return await fetch_export_bytes(KEYED_REF, client=client)
+
+    content, filename = _run(scenario())
+
+    assert content == b"PK\x03\x04docx-bytes"
+    assert filename == "Chapter 2 Report.docx"
+    assert len(queries) == 2
+    assert b"resourcekey" in queries[0]
+    assert b"resourcekey" not in queries[1]
+
+
+def test_resource_key_retry_exhausted_reports_sharing_problem():
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(410)
+
+    async def scenario():
+        async with _mock_client(handler) as client:
+            return await materialize_gdoc(KEYED_REF, client=client)
+
+    with pytest.raises(GdocError, match="Anyone with the link"):
+        _run(scenario())
+
+    assert attempts == 2
+
+
+def test_already_exported_source_is_passed_through_untouched():
+    """An export URL is resolved; re-fetching it would drop the caller's headers."""
+    from docling.datamodel.service.requests import ConvertSourcesRequest
+
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, content=b"docx-bytes")
+
+    export_url = (
+        f"https://docs.google.com/document/d/{DOC_ID}/export?format=docx"
+    )
+    request = ConvertSourcesRequest(
+        sources=[
+            {
+                "kind": "http",
+                "url": export_url,
+                "headers": {"Authorization": "Bearer caller-token"},
+            }
+        ]
+    )
+
+    async def scenario():
+        async with _mock_client(handler) as client:
+            return await normalize_gdoc_sources(request, client=client)
+
+    result = _run(scenario())
+
+    assert calls == []
+    assert len(result.sources) == 1
+    source = result.sources[0]
+    assert str(source.url) == export_url
+    assert source.headers == {"Authorization": "Bearer caller-token"}
+
+
+def test_caller_headers_are_forwarded_to_the_export_fetch():
+    from docling.datamodel.service.requests import ConvertSourcesRequest
+
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-disposition": 'attachment; filename="Doc.docx"'},
+            content=b"docx-bytes",
+        )
+
+    request = ConvertSourcesRequest(
+        sources=[
+            {
+                "kind": "http",
+                "url": f"https://docs.google.com/document/d/{DOC_ID}/edit",
+                "headers": {"Authorization": "Bearer caller-token"},
+            }
+        ]
+    )
+
+    async def scenario():
+        async with _mock_client(handler) as client:
+            return await normalize_gdoc_sources(request, client=client)
+
+    result = _run(scenario())
+
+    assert len(seen) == 1
+    assert seen[0].headers.get("authorization") == "Bearer caller-token"
+    assert result.sources[0].kind == "file"
+    assert result.sources[0].filename == "Doc.docx"
+
+
+def test_drive_download_url_is_passed_through_untouched():
+    from docling.datamodel.service.requests import ConvertSourcesRequest
+
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, content=b"bytes")
+
+    download_url = f"https://drive.google.com/uc?export=download&id={DOC_ID}"
+    request = ConvertSourcesRequest(sources=[{"kind": "http", "url": download_url}])
+
+    async def scenario():
+        async with _mock_client(handler) as client:
+            return await normalize_gdoc_sources(request, client=client)
+
+    result = _run(scenario())
+
+    assert calls == []
+    assert str(result.sources[0].url) == download_url

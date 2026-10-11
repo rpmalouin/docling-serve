@@ -18,8 +18,10 @@ failures into clear, user-facing 422 errors.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
@@ -72,6 +74,30 @@ _PATH_RE = re.compile(
     re.VERBOSE,
 )
 
+# "open?id=<id>" links (docs.google.com/open?id=..., docs.google.com/a/<domain>/open?id=...,
+# drive.google.com/open?id=...) are what Google Drive shortcut (.gdoc/.gsheet/.gslides)
+# files carry. The URL alone does not name the file type, so it returns "document" and
+# the caller corrects the kind from a stub extension or a /d/<kind>/ path.
+_OPEN_PATH_RE = re.compile(r"^(?:a/[^/]+/)?open/?$")
+
+# Shortcut file extension -> export kind. These files are ~170-byte JSON pointers,
+# not documents, so the serve layer resolves them before handing work to the engine.
+_STUB_EXT_KIND: dict[str, str] = {
+    ".gdoc": "document",
+    ".gsheet": "spreadsheet",
+    ".gslides": "presentation",
+}
+
+# Other Google Drive shortcut extensions we recognize but cannot convert, mapped to
+# the product name used in the user-facing error.
+_UNSUPPORTED_STUB_EXT: dict[str, str] = {
+    ".gform": "a Google Forms shortcut",
+    ".gdraw": "a Google Drawings shortcut",
+    ".gscript": "a Google Apps Script shortcut",
+    ".gjam": "a Google Jamboard shortcut",
+    ".gtable": "a Google Table shortcut",
+}
+
 _EXPORT_EXT: dict[str, str] = {
     "document": "docx",
     "spreadsheet": "xlsx",
@@ -85,12 +111,23 @@ class GdocError(Exception):
     """A Google link we recognized but cannot convert. str(exc) is user-facing."""
 
 
+class _AccessError(GdocError):
+    """Internal: the export was denied with a retryable access status.
+
+    Google's export endpoint is inconsistent about resource keys: a keyed link can
+    return 401/403/404/410 even when the same link works without the key. This
+    subtype lets :func:`fetch_export_bytes` tell that case apart from other failures
+    so it can retry once without the key.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class GdocRef:
     """A parsed reference to a single Google document, sheet, slide or file."""
 
     kind: str  # "document" | "spreadsheet" | "presentation" | "file"
     doc_id: str
+    resource_key: str | None = None
 
     def export_url(self) -> str:
         """Return Google's binary export/download URL for this reference.
@@ -99,18 +136,18 @@ class GdocRef:
         engine agree on which endpoint to fetch.
         """
         if self.kind == "file":
-            return f"https://drive.google.com/uc?export=download&id={self.doc_id}"
-        if self.kind == "document":
-            return f"{_GDOC_EXPORT_BASE}/document/d/{self.doc_id}/export?format=docx"
-        if self.kind == "spreadsheet":
-            return (
-                f"{_GDOC_EXPORT_BASE}/spreadsheets/d/{self.doc_id}/export?format=xlsx"
-            )
-        if self.kind == "presentation":
-            return (
-                f"{_GDOC_EXPORT_BASE}/presentation/d/{self.doc_id}/export?format=pptx"
-            )
-        raise GdocError(f"Unsupported Google document kind: {self.kind!r}")
+            url = f"https://drive.google.com/uc?export=download&id={self.doc_id}"
+        elif self.kind == "document":
+            url = f"{_GDOC_EXPORT_BASE}/document/d/{self.doc_id}/export?format=docx"
+        elif self.kind == "spreadsheet":
+            url = f"{_GDOC_EXPORT_BASE}/spreadsheets/d/{self.doc_id}/export?format=xlsx"
+        elif self.kind == "presentation":
+            url = f"{_GDOC_EXPORT_BASE}/presentation/d/{self.doc_id}/export?format=pptx"
+        else:
+            raise GdocError(f"Unsupported Google document kind: {self.kind!r}")
+        if self.resource_key:
+            url = f"{url}&resourcekey={self.resource_key}"
+        return url
 
 
 def _has_resource_key(parsed: SplitResult) -> bool:
@@ -159,6 +196,19 @@ def parse_gdoc_url(url: str) -> GdocRef | None:
             "document's normal /d/<id>/edit share link instead."
         )
 
+    if _OPEN_PATH_RE.match(path.lstrip("/")):
+        # The URL alone does not name the file type (open?id= works for Docs,
+        # Sheets and Slides alike), so assume "document"; callers correct the
+        # kind from a stub extension or a /d/<kind>/ path when available.
+        ids = parse_qs(parsed.query, keep_blank_values=True).get("id", [])
+        doc_id = ids[0] if ids else ""
+        if not _ID_RE.match(doc_id):
+            raise GdocError(
+                f"Malformed Google Docs link: could not read a valid document id "
+                f"({doc_id!r}). Paste the document's normal share link."
+            )
+        return GdocRef(kind="document", doc_id=doc_id)
+
     match = _PATH_RE.match(path.lstrip("/"))
     if match is None:
         raise GdocError(_unrecognized_message(url))
@@ -171,6 +221,87 @@ def parse_gdoc_url(url: str) -> GdocRef | None:
         )
 
     return GdocRef(kind=_PATH_KIND[match.group("kind")], doc_id=doc_id)
+
+
+def _stub_resource_key(data: dict[str, object]) -> str | None:
+    """Return the first usable resource key carried by a shortcut pointer."""
+    for key in ("resource_key", "resourcekey", "resourceKey"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def parse_gdoc_stub(filename: str, content: bytes) -> GdocRef | None:
+    """Resolve an uploaded Google Drive shortcut file to a :class:`GdocRef`.
+
+    Google Drive stores ``.gdoc``/``.gsheet``/``.gslides`` files as a small JSON
+    pointer (``{"url": "https://docs.google.com/open?id=<id>", "doc_id": ...}``)
+    rather than a document, which the engine cannot parse. This reads that stub
+    and returns the real reference so the caller can fetch the export instead.
+
+    Returns ``None`` for a filename that is not a Google shortcut, so a normal
+    upload passes through untouched. Raises :class:`GdocError` for a recognized
+    shortcut that cannot be resolved or converted.
+    """
+    suffix = Path(filename).suffix.lower()
+    unsupported = _UNSUPPORTED_STUB_EXT.get(suffix)
+    if unsupported is not None:
+        raise GdocError(
+            f"{filename!r} is {unsupported}, which cannot be converted. Export it "
+            "from Google Drive as a supported file type and upload that."
+        )
+
+    ext_kind = _STUB_EXT_KIND.get(suffix)
+    if ext_kind is None:
+        return None
+
+    def _bad_stub() -> GdocError:
+        return GdocError(
+            f"{filename!r} does not look like a Google Drive shortcut: expected a "
+            "JSON pointer with a document id (got malformed or incomplete data)."
+        )
+
+    try:
+        text = content.decode("utf-8-sig").strip()
+    except UnicodeDecodeError as exc:
+        raise _bad_stub() from exc
+
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _bad_stub() from exc
+    if not isinstance(data, dict):
+        raise _bad_stub()
+
+    resource_key = _stub_resource_key(data)
+
+    kind = ext_kind
+    doc_id = data.get("doc_id")
+    url_ref: GdocRef | None = None
+    url = data.get("url")
+    if isinstance(url, str) and url:
+        try:
+            url_ref = parse_gdoc_url(url)
+        except GdocError as exc:
+            if not (isinstance(doc_id, str) and doc_id):
+                raise GdocError(
+                    f"{filename!r} does not look like a Google Drive shortcut: {exc}"
+                ) from exc
+            url_ref = None
+        if url_ref is not None:
+            path = urlsplit(url).path.lstrip("/")
+            if _PATH_RE.match(path):
+                # A real /d/<kind>/ link names the type, so it wins over the
+                # shortcut's extension; the bare open?id= form does not.
+                kind = url_ref.kind
+
+    if not (isinstance(doc_id, str) and doc_id):
+        if url_ref is None:
+            raise _bad_stub()
+        doc_id = url_ref.doc_id
+
+    return GdocRef(kind=kind, doc_id=doc_id, resource_key=resource_key)
 
 
 def _not_accessible_message(doc_id: str) -> str:
@@ -240,12 +371,123 @@ def _too_large_message(ref: GdocRef, size: int, limit: int) -> str:
     )
 
 
+async def _fetch_export_once(
+    ref: GdocRef,
+    client: httpx.AsyncClient,
+    *,
+    max_file_size: int | None,
+    headers: Mapping[str, str] | None = None,
+) -> tuple[bytes, str]:
+    """Fetch one Google export attempt, returning ``(content, filename)``."""
+    url = ref.export_url()
+    _log.info("Materializing Google %s export for id=%s", ref.kind, ref.doc_id)
+    try:
+        async with client.stream("GET", url, headers=dict(headers or {})) as response:
+            status = response.status_code
+            if status in (401, 403, 404, 410):
+                raise _AccessError(_not_accessible_message(ref.doc_id))
+            if status >= 400:
+                raise GdocError(
+                    f"Google returned HTTP {status} when exporting "
+                    f"document {ref.doc_id}."
+                )
+
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type.lower():
+                # Google served its sign-in interstitial, not a document.
+                raise GdocError(_not_accessible_message(ref.doc_id))
+
+            if max_file_size is not None:
+                declared = response.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        declared_size = int(declared)
+                    except ValueError:
+                        declared_size = None
+                    if declared_size is not None and declared_size > max_file_size:
+                        raise GdocError(
+                            _too_large_message(ref, declared_size, max_file_size)
+                        )
+
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if max_file_size is not None and received > max_file_size:
+                    raise GdocError(_too_large_message(ref, received, max_file_size))
+                chunks.append(chunk)
+
+            content = b"".join(chunks)
+            filename = _resolve_filename(ref, response.headers)
+    except GdocError:
+        raise
+    except httpx.HTTPError as exc:
+        raise GdocError(
+            f"Could not reach Google to export document {ref.doc_id}: {exc}"
+        ) from exc
+
+    _log.info(
+        "Materialized Google export id=%s as %r (%d bytes)",
+        ref.doc_id,
+        filename,
+        len(content),
+    )
+    return content, filename
+
+
+async def fetch_export_bytes(
+    ref: GdocRef,
+    *,
+    max_file_size: int | None = None,
+    timeout: float = 120.0,
+    client: httpx.AsyncClient | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> tuple[bytes, str]:
+    """Fetch a Google export, returning ``(content, filename)``.
+
+    Shared by the HTTP-source path (:func:`materialize_gdoc`) and the uploaded
+    Google shortcut path in the API layer. ``headers`` are the caller's own
+    request headers (e.g. an ``Authorization`` bearer token from an http source);
+    they are sent on every attempt. When ``ref.resource_key`` is set and the first
+    attempt is denied with 401/403/404/410, retry once without the key, because
+    Google's export endpoint is inconsistent about keyed links.
+
+    Raises:
+        GdocError: The export could not be fetched or is not a binary document.
+    """
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(follow_redirects=True, timeout=timeout)
+
+    try:
+        try:
+            return await _fetch_export_once(
+                ref, client, max_file_size=max_file_size, headers=headers
+            )
+        except _AccessError:
+            if ref.resource_key is None:
+                raise
+            _log.info(
+                "Retrying Google %s export for id=%s without resource key",
+                ref.kind,
+                ref.doc_id,
+            )
+            bare = GdocRef(kind=ref.kind, doc_id=ref.doc_id)
+            return await _fetch_export_once(
+                bare, client, max_file_size=max_file_size, headers=headers
+            )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
 async def materialize_gdoc(
     ref: GdocRef,
     *,
     max_file_size: int | None = None,
     timeout: float = 120.0,
     client: httpx.AsyncClient | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> FileSourceRequest:
     """Fetch a Google export and wrap it as a ``FileSourceRequest``.
 
@@ -256,74 +498,19 @@ async def materialize_gdoc(
         timeout: Request timeout, in seconds, used when creating a client.
         client: Optional pre-built client (tests inject a mock transport). When
             omitted, a client is created and closed here.
+        headers: Optional caller headers to send with the export request.
 
     Raises:
         GdocError: The export could not be fetched or is not a binary document.
     """
     from docling.datamodel.service.requests import FileSourceRequest
 
-    owns_client = client is None
-    if client is None:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=timeout)
-
-    url = ref.export_url()
-    _log.info("Materializing Google %s export for id=%s", ref.kind, ref.doc_id)
-    try:
-        try:
-            async with client.stream("GET", url) as response:
-                status = response.status_code
-                if status in (401, 403, 404, 410):
-                    raise GdocError(_not_accessible_message(ref.doc_id))
-                if status >= 400:
-                    raise GdocError(
-                        f"Google returned HTTP {status} when exporting "
-                        f"document {ref.doc_id}."
-                    )
-
-                content_type = response.headers.get("content-type", "")
-                if "text/html" in content_type.lower():
-                    # Google served its sign-in interstitial, not a document.
-                    raise GdocError(_not_accessible_message(ref.doc_id))
-
-                if max_file_size is not None:
-                    declared = response.headers.get("content-length")
-                    if declared is not None:
-                        try:
-                            declared_size = int(declared)
-                        except ValueError:
-                            declared_size = None
-                        if declared_size is not None and declared_size > max_file_size:
-                            raise GdocError(
-                                _too_large_message(ref, declared_size, max_file_size)
-                            )
-
-                chunks: list[bytes] = []
-                received = 0
-                async for chunk in response.aiter_bytes():
-                    received += len(chunk)
-                    if max_file_size is not None and received > max_file_size:
-                        raise GdocError(
-                            _too_large_message(ref, received, max_file_size)
-                        )
-                    chunks.append(chunk)
-
-                content = b"".join(chunks)
-                filename = _resolve_filename(ref, response.headers)
-        except GdocError:
-            raise
-        except httpx.HTTPError as exc:
-            raise GdocError(
-                f"Could not reach Google to export document {ref.doc_id}: {exc}"
-            ) from exc
-    finally:
-        if owns_client:
-            await client.aclose()
-
-    _log.info(
-        "Materialized Google export id=%s as %r (%d bytes)",
-        ref.doc_id,
-        filename,
-        len(content),
+    content, filename = await fetch_export_bytes(
+        ref,
+        max_file_size=max_file_size,
+        timeout=timeout,
+        client=client,
+        headers=headers,
     )
     return FileSourceRequest(
         base64_string=base64.b64encode(content).decode("ascii"),
@@ -332,6 +519,29 @@ async def materialize_gdoc(
 
 
 _ConvertRequestT = TypeVar("_ConvertRequestT", bound=BaseModel)
+
+# Hosts Google redirects an export/download to. A URL already on one of these —
+# or an explicit export path — is resolved; re-materializing it would discard the
+# caller's own headers, so it is passed through untouched.
+_EXPORT_HOSTS = frozenset({"drive.usercontent.google.com"})
+
+
+def is_gdoc_export_url(url: str) -> bool:
+    """Return whether ``url`` already points at Google's export/download endpoint."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+
+    host = (parsed.hostname or "").lower()
+    path = parsed.path
+    if host in _EXPORT_HOSTS:
+        return True
+    if host == "docs.google.com":
+        return "/export" in path and _PATH_RE.match(path.lstrip("/")) is not None
+    if host == "drive.google.com":
+        return path.startswith("/uc") and "export=download" in parsed.query.lower()
+    return False
 
 
 async def normalize_gdoc_sources(
@@ -344,13 +554,16 @@ async def normalize_gdoc_sources(
     """Replace HTTP sources that are Google links with materialized exports.
 
     Sources that are not recognized Google links are left untouched, so a plain
-    ``http`` source keeps flowing through the normal engine fetch path.
+    ``http`` source keeps flowing through the normal engine fetch path. A source
+    that already points at Google's export endpoint is left untouched too: it is
+    resolved, and re-fetching it here would drop the caller's own headers (an
+    ``Authorization`` bearer token, for instance).
     """
     new_sources = []
     for source in request.sources:  # type: ignore[attr-defined]
         if getattr(source, "kind", None) == "http":
             url = getattr(source, "url", None)
-            if url is not None:
+            if url is not None and not is_gdoc_export_url(str(url)):
                 ref = parse_gdoc_url(str(url))
                 if ref is not None:
                     new_sources.append(
@@ -359,6 +572,7 @@ async def normalize_gdoc_sources(
                             max_file_size=max_file_size,
                             timeout=timeout,
                             client=client,
+                            headers=getattr(source, "headers", None),
                         )
                     )
                     continue

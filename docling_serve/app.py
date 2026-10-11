@@ -98,6 +98,7 @@ from docling_jobkit.orchestrators.base_orchestrator import (
 )
 from docling_jobkit.orchestrators.rq.orchestrator import RQOrchestrator
 
+from docling_serve import gdocs
 from docling_serve.auth import APIKeyAuth, AuthenticationResult
 from docling_serve.capabilities import CapabilitiesResponse, build_capabilities
 from docling_serve.gdocs import GdocError, normalize_gdoc_sources
@@ -584,6 +585,29 @@ def create_app():  # noqa: C901
                 f"File {i}: name={name}, size={len(file_bytes)} bytes, "
                 f"md5={file_hash}, content_type={file.content_type}"
             )
+
+            # A Google Drive shortcut (.gdoc/.gsheet/.gslides) is a JSON pointer,
+            # not a document: resolve it to the real export before enqueueing.
+            try:
+                stub = gdocs.parse_gdoc_stub(name, file_bytes)
+                if stub is not None:
+                    export_bytes, export_name = await gdocs.fetch_export_bytes(
+                        stub, max_file_size=docling_serve_settings.max_file_size
+                    )
+                    _log.info(
+                        "Resolved Google shortcut %r -> %r (%d bytes)",
+                        name,
+                        export_name,
+                        len(export_bytes),
+                    )
+                    file_sources.append(
+                        DocumentStream(name=export_name, stream=BytesIO(export_bytes))
+                    )
+                    continue
+            except GdocError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+                ) from exc
 
             file_sources.append(DocumentStream(name=name, stream=buf))
 

@@ -141,7 +141,9 @@ export function SourceInput({ source, onChange, maxFileSize }: Props) {
               <FileUp className="size-6 text-brand" />
               <p className="text-sm font-medium">Drop a document anywhere or click to browse</p>
               <p className="text-xs text-muted-foreground">
-                PDF, DOCX, PPTX, HTML, images and more
+                PDF, DOCX, PPTX, HTML, images and more, plus Google
+                Docs/Sheets/Slides shortcuts (.gdoc/.gsheet/.gslides) — the linked
+                document is fetched and converted
                 {maxFileSize ? ` · up to ${formatBytes(maxFileSize)}` : ""}
               </p>
             </>
