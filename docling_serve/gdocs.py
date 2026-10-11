@@ -31,7 +31,11 @@ import httpx
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
+    from google.oauth2.credentials import Credentials
+
     from docling.datamodel.service.requests import FileSourceRequest
+
+    from docling_serve.settings import DoclingServeSettings
 
 _log = logging.getLogger(__name__)
 
@@ -119,6 +123,58 @@ class _AccessError(GdocError):
     subtype lets :func:`fetch_export_bytes` tell that case apart from other failures
     so it can retry once without the key.
     """
+
+
+#: OAuth token endpoint used to refresh the configured Google credentials.
+_GDOC_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# Module-level cache: one refreshed Google credentials object serves every
+# conversion for the life of the process, instead of refreshing per request.
+_credentials: Credentials | None = None
+
+
+def google_access_token(settings: DoclingServeSettings) -> str | None:
+    """Return a bearer token for the configured Google credentials, or None when unconfigured.
+
+    The credentials are refreshed lazily and cached in a module global so an hour
+    of conversions reuses one access token. The configured secret values are never
+    logged; only whether credentials are present.
+    """
+    global _credentials
+
+    client_id = settings.gdoc_client_id
+    client_secret = settings.gdoc_client_secret.get_secret_value()
+    refresh_token = settings.gdoc_refresh_token.get_secret_value()
+    if not (client_id and client_secret and refresh_token):
+        _log.debug("Google credentials are not configured (credentials=no)")
+        return None
+
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+
+    if _credentials is None:
+        _credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri=_GDOC_TOKEN_URI,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+
+    if _credentials.expired or not _credentials.token:
+        try:
+            _credentials.refresh(Request())
+        except Exception as exc:
+            _credentials = None
+            raise GdocError(
+                "The configured Google credentials could not be refreshed. Check "
+                "the DOCLING_SERVE_GDOC_CLIENT_ID, "
+                "DOCLING_SERVE_GDOC_CLIENT_SECRET and "
+                "DOCLING_SERVE_GDOC_REFRESH_TOKEN settings."
+            ) from exc
+        _log.info("Refreshed the configured Google credentials (credentials=yes)")
+
+    return _credentials.token
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,11 +360,17 @@ def parse_gdoc_stub(filename: str, content: bytes) -> GdocRef | None:
     return GdocRef(kind=kind, doc_id=doc_id, resource_key=resource_key)
 
 
-def _not_accessible_message(doc_id: str) -> str:
-    return (
+def _not_accessible_message(doc_id: str, *, credentials_configured: bool = False) -> str:
+    message = (
         f"Google document {doc_id} is not accessible without signing in. "
         "Share it with 'Anyone with the link → Viewer' and retry."
     )
+    if credentials_configured:
+        message += (
+            " The configured Google credentials also failed to open it; check that "
+            "the document is accessible to that Google account."
+        )
+    return message
 
 
 def _sanitize_filename(value: str) -> str | None:
@@ -377,6 +439,7 @@ async def _fetch_export_once(
     *,
     max_file_size: int | None,
     headers: Mapping[str, str] | None = None,
+    credentials_configured: bool = False,
 ) -> tuple[bytes, str]:
     """Fetch one Google export attempt, returning ``(content, filename)``."""
     url = ref.export_url()
@@ -385,7 +448,11 @@ async def _fetch_export_once(
         async with client.stream("GET", url, headers=dict(headers or {})) as response:
             status = response.status_code
             if status in (401, 403, 404, 410):
-                raise _AccessError(_not_accessible_message(ref.doc_id))
+                raise _AccessError(
+                    _not_accessible_message(
+                        ref.doc_id, credentials_configured=credentials_configured
+                    )
+                )
             if status >= 400:
                 raise GdocError(
                     f"Google returned HTTP {status} when exporting "
@@ -395,7 +462,11 @@ async def _fetch_export_once(
             content_type = response.headers.get("content-type", "")
             if "text/html" in content_type.lower():
                 # Google served its sign-in interstitial, not a document.
-                raise GdocError(_not_accessible_message(ref.doc_id))
+                raise GdocError(
+                    _not_accessible_message(
+                        ref.doc_id, credentials_configured=credentials_configured
+                    )
+                )
 
             if max_file_size is not None:
                 declared = response.headers.get("content-length")
@@ -442,40 +513,96 @@ async def fetch_export_bytes(
     timeout: float = 120.0,
     client: httpx.AsyncClient | None = None,
     headers: Mapping[str, str] | None = None,
+    settings: DoclingServeSettings | None = None,
 ) -> tuple[bytes, str]:
     """Fetch a Google export, returning ``(content, filename)``.
 
     Shared by the HTTP-source path (:func:`materialize_gdoc`) and the uploaded
     Google shortcut path in the API layer. ``headers`` are the caller's own
     request headers (e.g. an ``Authorization`` bearer token from an http source);
-    they are sent on every attempt. When ``ref.resource_key`` is set and the first
-    attempt is denied with 401/403/404/410, retry once without the key, because
-    Google's export endpoint is inconsistent about keyed links.
+    they win over the configured credentials and are sent on every attempt. When
+    no ``Authorization`` header is supplied and the optional
+    ``DOCLING_SERVE_GDOC_*`` credentials are configured, a refreshed bearer token
+    is added.
+
+    Each attempt is retried in order, stopping at the first success: with the
+    resource key (if any), then without it (Google's export endpoint is
+    inconsistent about keyed links), then once more without the credential-derived
+    ``Authorization`` header so a broken credential cannot block a public document.
 
     Raises:
         GdocError: The export could not be fetched or is not a binary document.
     """
+    from docling_serve import settings as settings_module
+
+    resolved_settings = settings or settings_module.docling_serve_settings
+
+    request_headers = dict(headers or {})
+    has_caller_authorization = any(
+        key.lower() == "authorization" for key in request_headers
+    )
+    credentials_used = False
+    if not has_caller_authorization:
+        token = google_access_token(resolved_settings)
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
+            credentials_used = True
+
+    _log.info(
+        "Fetching Google %s export for id=%s credentials=%s",
+        ref.kind,
+        ref.doc_id,
+        "yes" if credentials_used else "no",
+    )
+
     owns_client = client is None
     if client is None:
         client = httpx.AsyncClient(follow_redirects=True, timeout=timeout)
 
+    async def _attempt(
+        target: GdocRef, attempt_headers: Mapping[str, str]
+    ) -> tuple[bytes, str]:
+        return await _fetch_export_once(
+            target,
+            client,
+            max_file_size=max_file_size,
+            headers=attempt_headers,
+            credentials_configured=credentials_used,
+        )
+
     try:
         try:
-            return await _fetch_export_once(
-                ref, client, max_file_size=max_file_size, headers=headers
-            )
+            return await _attempt(ref, request_headers)
         except _AccessError:
-            if ref.resource_key is None:
-                raise
+            pass
+
+        bare = ref
+        if ref.resource_key is not None:
             _log.info(
                 "Retrying Google %s export for id=%s without resource key",
                 ref.kind,
                 ref.doc_id,
             )
             bare = GdocRef(kind=ref.kind, doc_id=ref.doc_id)
-            return await _fetch_export_once(
-                bare, client, max_file_size=max_file_size, headers=headers
+            try:
+                return await _attempt(bare, request_headers)
+            except _AccessError:
+                pass
+
+        if credentials_used:
+            _log.info(
+                "Retrying Google %s export for id=%s without credentials",
+                ref.kind,
+                ref.doc_id,
             )
+            try:
+                return await _attempt(bare, dict(headers or {}))
+            except _AccessError:
+                pass
+
+        raise _AccessError(
+            _not_accessible_message(ref.doc_id, credentials_configured=credentials_used)
+        )
     finally:
         if owns_client:
             await client.aclose()
@@ -488,6 +615,7 @@ async def materialize_gdoc(
     timeout: float = 120.0,
     client: httpx.AsyncClient | None = None,
     headers: Mapping[str, str] | None = None,
+    settings: DoclingServeSettings | None = None,
 ) -> FileSourceRequest:
     """Fetch a Google export and wrap it as a ``FileSourceRequest``.
 
@@ -499,6 +627,8 @@ async def materialize_gdoc(
         client: Optional pre-built client (tests inject a mock transport). When
             omitted, a client is created and closed here.
         headers: Optional caller headers to send with the export request.
+        settings: Optional settings; defaults to the process settings. Only the
+            optional Google credentials are read from it.
 
     Raises:
         GdocError: The export could not be fetched or is not a binary document.
@@ -511,6 +641,7 @@ async def materialize_gdoc(
         timeout=timeout,
         client=client,
         headers=headers,
+        settings=settings,
     )
     return FileSourceRequest(
         base64_string=base64.b64encode(content).decode("ascii"),

@@ -10,6 +10,7 @@ from pydantic import (
     AliasChoices,
     Field,
     PositiveFloat,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -145,6 +146,12 @@ class DoclingServeSettings(BaseSettings):
     debug_error_details: bool = False
 
     api_key: str = ""
+
+    # Optional Google credentials for exporting private Docs/Sheets/Slides/Drive
+    # files. When unset, Google exports are fetched unauthenticated (as before).
+    gdoc_client_id: str = ""
+    gdoc_client_secret: SecretStr = SecretStr("")
+    gdoc_refresh_token: SecretStr = SecretStr("")
 
     max_document_timeout: float = 3_600 * 24 * 7  # 7 days
     max_num_pages: int = sys.maxsize
