@@ -449,5 +449,5 @@ cookies.txt
 docling_serve/ui_static/
 
 # Agent working notes for this fork (never upstream content)
+# FORK.md is deliberately TRACKED (it explains the fork); MEMORY.md is not.
 MEMORY.md
-FORK.md
