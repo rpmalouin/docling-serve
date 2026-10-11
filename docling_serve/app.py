@@ -100,6 +100,7 @@ from docling_jobkit.orchestrators.rq.orchestrator import RQOrchestrator
 
 from docling_serve.auth import APIKeyAuth, AuthenticationResult
 from docling_serve.capabilities import CapabilitiesResponse, build_capabilities
+from docling_serve.gdocs import GdocError, normalize_gdoc_sources
 from docling_serve.helper_functions import (
     DOCLING_VERSIONS,
     FormDepends,
@@ -649,23 +650,47 @@ def create_app():  # noqa: C901
             if elapsed_time > docling_serve_settings.max_sync_wait:
                 return False
 
-    def _prepare_convert_request(
+    async def _prepare_convert_request(
         request: ConvertSourcesRequest,
     ) -> ConvertSourcesRequest:
+        try:
+            request = await normalize_gdoc_sources(
+                request, max_file_size=docling_serve_settings.max_file_size
+            )
+        except GdocError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
         normalized_request = normalize_request(request, service_policy)
         validate_convert_request(normalized_request, service_policy)
         return normalized_request
 
-    def _prepare_batch_convert_request(
+    async def _prepare_batch_convert_request(
         request: BatchConvertSourcesRequest,
     ) -> BatchConvertSourcesRequest:
+        try:
+            request = await normalize_gdoc_sources(
+                request, max_file_size=docling_serve_settings.max_file_size
+            )
+        except GdocError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
         normalized_request = normalize_request(request, service_policy)
         validate_batch_convert_request(normalized_request, service_policy)
         return normalized_request
 
-    def _prepare_chunk_request(
+    async def _prepare_chunk_request(
         request: GenericChunkDocumentsRequest,
     ) -> GenericChunkDocumentsRequest:
+        try:
+            request = await normalize_gdoc_sources(
+                request, max_file_size=docling_serve_settings.max_file_size
+            )
+        except GdocError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
         normalized_request = request.model_copy(
             update={
                 "convert_options": normalize_convert_options(
@@ -840,7 +865,7 @@ def create_app():  # noqa: C901
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
         ] = None,
     ):
-        prepared_request = _prepare_convert_request(conversion_request)
+        prepared_request = await _prepare_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
         _log.info(f"[TENANT_ID] process_url endpoint received tenant_id='{tenant_id}'")
         task = await _enqueue_source(
@@ -965,7 +990,7 @@ def create_app():  # noqa: C901
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
         ] = None,
     ):
-        prepared_request = _prepare_convert_request(conversion_request)
+        prepared_request = await _prepare_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
         _log.info(
             f"[TENANT_ID] process_url_async endpoint received tenant_id='{tenant_id}'"
@@ -999,7 +1024,7 @@ def create_app():  # noqa: C901
             str | None, Header(alias=docling_serve_settings.eng_ray_tenant_id_header)
         ] = None,
     ):
-        conversion_request = _prepare_batch_convert_request(conversion_request)
+        conversion_request = await _prepare_batch_convert_request(conversion_request)
         tenant_id = _get_tenant_id_from_header(x_tenant_id)
         _log.info(
             f"[TENANT_ID] process_source_batch endpoint received tenant_id='{tenant_id}'"
@@ -1108,7 +1133,7 @@ def create_app():  # noqa: C901
                 Header(alias=docling_serve_settings.eng_ray_tenant_id_header),
             ] = None,
         ):
-            request = _prepare_chunk_request(request)
+            request = await _prepare_chunk_request(request)
             tenant_id = _get_tenant_id_from_header(x_tenant_id)
             _log.info(
                 f"[TENANT_ID] chunk_source_async ({path_name}) endpoint received tenant_id='{tenant_id}'"
@@ -1233,7 +1258,7 @@ def create_app():  # noqa: C901
                 Header(alias=docling_serve_settings.eng_ray_tenant_id_header),
             ] = None,
         ):
-            request = _prepare_chunk_request(request)
+            request = await _prepare_chunk_request(request)
             tenant_id = _get_tenant_id_from_header(x_tenant_id)
             _log.info(
                 f"[TENANT_ID] chunk_source ({path_name}) endpoint received tenant_id='{tenant_id}'"

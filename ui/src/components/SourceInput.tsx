@@ -1,4 +1,4 @@
-import { FileUp, Link2, X } from "lucide-react";
+import { FileText, FileUp, Link2, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,11 @@ interface Props {
   maxFileSize?: number | null;
 }
 
+type InputMode = "file" | "http" | "gdoc";
+
+const GOOGLE_URL_PATTERN = /^https?:\/\/(docs|drive)\.google\.com\//i;
+const PUBLISHED_GDOC_PATTERN = /\/d\/e\/[^/]+\/pub/i;
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KB", "MB", "GB"];
@@ -26,14 +31,36 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
+/** Inline warning for a pasted link the server will reject. */
+function gdocWarning(value: string): string | null {
+  const link = value.trim();
+  if (!link) return null;
+  if (PUBLISHED_GDOC_PATTERN.test(link)) {
+    return "This is a published-to-web link. Use the document's plain share link (…/d/<id>/edit) instead.";
+  }
+  if (link.includes("resourcekey=")) {
+    return "This link is resource-key protected. Copy the plain share link (without resourcekey) instead.";
+  }
+  return null;
+}
+
 export function SourceInput({ source, onChange, maxFileSize }: Props) {
-  const [mode, setMode] = useState<"file" | "http">(source?.kind ?? "file");
+  const [mode, setMode] = useState<InputMode>(source?.kind ?? "file");
   const [url, setUrl] = useState(source?.kind === "http" ? source.url : "");
+  const [gdocUrl, setGdocUrl] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Echoes of our own onChange must not snap the active tab back to the kind
+  // carried by the emitted source (a Google Doc link is still `http`).
+  const emitted = useRef<Source | null>(null);
+
+  const emit = (next: Source | null) => {
+    emitted.current = next;
+    onChange(next);
+  };
 
   // Follow sources set from outside (example links, files dropped on the page).
   useEffect(() => {
-    if (!source) return;
+    if (!source || source === emitted.current) return;
     setMode(source.kind);
     if (source.kind === "http") setUrl(source.url);
   }, [source]);
@@ -42,24 +69,38 @@ export function SourceInput({ source, onChange, maxFileSize }: Props) {
 
   const pick = (files: FileList | null) => {
     const picked = files?.[0];
-    if (picked) onChange({ kind: "file", file: picked });
+    if (picked) emit({ kind: "file", file: picked });
   };
+
+  const selectMode = (next: InputMode) => {
+    setMode(next);
+    if (next === "http") {
+      emit(url.trim() ? { kind: "http", url: url.trim() } : null);
+    } else if (next === "gdoc") {
+      emit(gdocUrl.trim() ? { kind: "http", url: gdocUrl.trim() } : null);
+    } else {
+      emit(null);
+    }
+  };
+
+  const gdocValue = gdocUrl.trim();
+  const warning = gdocWarning(gdocUrl);
+  const googleUrl = GOOGLE_URL_PATTERN.test(url.trim());
 
   return (
     <Tabs
       value={mode}
-      onValueChange={(value) => {
-        const next = value as "file" | "http";
-        setMode(next);
-        onChange(next === "http" ? (url ? { kind: "http", url } : null) : null);
-      }}
+      onValueChange={(value) => selectMode(value as InputMode)}
     >
-      <TabsList className="grid w-full grid-cols-2">
+      <TabsList className="grid w-full grid-cols-3">
         <TabsTrigger value="file">
           <FileUp className="size-4" /> File
         </TabsTrigger>
         <TabsTrigger value="http">
           <Link2 className="size-4" /> URL
+        </TabsTrigger>
+        <TabsTrigger value="gdoc">
+          <FileText className="size-4" /> Google Doc
         </TabsTrigger>
       </TabsList>
 
@@ -88,7 +129,7 @@ export function SourceInput({ source, onChange, maxFileSize }: Props) {
                 aria-label="Remove file"
                 onClick={(event) => {
                   event.stopPropagation();
-                  onChange(null);
+                  emit(null);
                   if (inputRef.current) inputRef.current.value = "";
                 }}
               >
@@ -117,9 +158,37 @@ export function SourceInput({ source, onChange, maxFileSize }: Props) {
           onChange={(event) => {
             const next = event.target.value;
             setUrl(next);
-            onChange(next.trim() ? { kind: "http", url: next.trim() } : null);
+            emit(next.trim() ? { kind: "http", url: next.trim() } : null);
           }}
         />
+        {googleUrl && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            Google Docs, Sheets and Slides links are exported as docx/xlsx/pptx before
+            conversion.
+          </p>
+        )}
+      </TabsContent>
+
+      <TabsContent value="gdoc">
+        <Input
+          type="url"
+          placeholder="https://docs.google.com/document/d/…/edit"
+          value={gdocUrl}
+          onChange={(event) => {
+            const next = event.target.value;
+            setGdocUrl(next);
+            emit(next.trim() ? { kind: "http", url: next.trim() } : null);
+          }}
+        />
+        <p className="mt-2 text-xs text-muted-foreground">
+          The document must be shared: Anyone with the link → Viewer.
+        </p>
+        {warning && <p className="mt-1 text-xs text-destructive">{warning}</p>}
+        {!warning && gdocValue && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Fetched from Google as docx/xlsx/pptx, then converted.
+          </p>
+        )}
       </TabsContent>
     </Tabs>
   );
